@@ -813,6 +813,52 @@ def track_once(kind: str, target: str = "") -> None:
         track(kind, target)
 
 
+# ---------- 流入元 (2026-09-05, #45) ----------
+# X でスロット関連アカウントをフォローして流入を増やす施策を検討している。
+# 「増やす前に、効果を測れる状態にする」ために足した。フォロワーが増えても
+# クリックは増えない、という結果もありうるので、そこを区別できるようにしておく。
+#
+# 取るのは **ホスト名だけ**。フルURLは検索語を含みうるので取らない。
+# 上の「記録しないもの: IP・UA・その他個人を特定しうる情報」の方針に揃える。
+_SELF_HOSTS = {"hallscore.com", "hallscore.streamlit.app", "127.0.0.1", "localhost"}
+
+
+def track_source() -> None:
+    """セッションの流入元を1回だけ記録する。
+
+    ?ref= を優先し、無ければ Referer のホストを見る。
+      ?ref=   … x_bio (プロフィール) / x (投稿) / x_pin (固定ポスト) と分けて付ける
+      Referer … 🚨 X 経由では取れなかった (2026-09-05 実測, #47)。st.context.headers が
+                 見ているのは WebSocket ハンドシェイクで、そこに Referer が載らない。
+                 タグ無しの流入は全部 direct になる。コードは残してあるが、
+                 **タグが唯一の識別手段**だと思って運用すること。
+                 タグ無しも拾いたければ Cloudflare Worker 側で Referer を読んで
+                 ?ref= を付けてリダイレクトする (Worker は最初の HTTP を見ている)
+    """
+    if st.session_state.get("_src_done"):
+        return
+    st.session_state["_src_done"] = True
+    try:
+        ref = str(st.query_params.get("ref", "")).strip().lower()[:40]
+        if ref:
+            src = f"tag:{ref}"
+        else:
+            from urllib.parse import urlparse
+            hdr = st.context.headers
+            raw = hdr.get("Referer") or hdr.get("referer") or ""
+            host = (urlparse(raw).hostname or "").lower()
+            host = host[4:] if host.startswith("www.") else host
+            if not host:
+                src = "direct"
+            elif host in _SELF_HOSTS or host.endswith(".hallscore.com"):
+                return              # 内部遷移は流入ではない
+            else:
+                src = host[:60]
+    except Exception:
+        return                      # 計測の失敗でアプリを止めない
+    track("source", src)
+
+
 # ---------- 根拠の強さラベル (2026-09-01 の検証結果に基づく) ----------
 # 前向き検証 (前半で学習→後半で評価) を通ったものだけを「検証済み」と呼ぶ。
 # 通らなかったもの・決着しなかったものは、数字は出すがラベルで区別する。
@@ -1038,7 +1084,7 @@ def recommend_units(hall: str, machine: str, rules: list) -> pd.DataFrame:
             if L >= 3 and pos == 0 and p_sc >= 30:
                 why.append(f"端が出ていた ({p_sc:+,.0f}枚)")
             elif p_sc >= 30:
-                why.append(f"端から{pos + 1}番目が甘い ({p_sc:+,.0f}枚)")
+                why.append(f"端から{pos + 1}番目が出ていた ({p_sc:+,.0f}枚)")
             rows.append({"台番": no, "この店の平均より": round(t_sc + p_sc),
                          "根拠": " / ".join(why) or "特筆なし"})
     df = pd.DataFrame(rows).sort_values("この店の平均より", ascending=False).head(8)
@@ -1221,21 +1267,32 @@ def trend_qa() -> list[dict]:
                     "次に狙う根拠にはならないと考えてください。"})
     # 角台
     edge = con.execute("""SELECT AVG(edge_mai-mid_mai) FROM hall_edge_stats WHERE kind='event'""").fetchone()[0]
-    # 「端に高設定を固める店は個別に存在する」は撤回 (2026-09-04, Issue #3 Phase A)。
-    # 店ごとに「その日、端と中の差が偶然より大きいか」を店内シャッフルで判定したところ、
-    # 有意店は 5/506 で偶然の期待 25 店を大きく下回った (z=-4.1)。癖が無いのでなく
-    # 店が端を意図的に均一にしていると読める。端は G数も少なく座られにくい。
+    # 角台調査 v2 (2026-09-06, Issue #73) で作り直した。旧 a5 は角の定義・島サイズ・稼働の交絡・
+    # イベント日の分割に穴があり、その結論 (5/506、「端は G数も少ない」) は撤回。
+    # v2: レポートごとの同一機種・隣接ブロック (>=6台) をジャグラーで作り、島の全台が回された日
+    # (角と中の games がほぼ同じ) で角 vs 中を比較 → イベント日 -0.42/-0.18pt、非告知日 -0.40/-0.14pt
+    # (加重/台日平均、いずれも z 6〜16)。角2・角3 は中と ±0.08pt 以内。角が甘い側で有意な店 11 vs
+    # 期待 15.9 (30%の日に角へ6を置く癖なら 76% で検出)。角は負けている台ほど長く打たれる
+    # (大負け階級で回転数 1.14倍、大勝ちで 1.00倍) = 快適さで回されている。
     edge_msg = ("むしろ端は中より不利" if edge < -30 else
                 "全店平均では中の台と大差なし" if edge <= 30 else
                 "全店平均では端がやや甘い")
     qa.append({"q": "角台(島の端)は狙い目?",
-               "a": edge_msg + "。端に固める店も見つかりません",
-               "d": f"イベント日の『機種の並びの端 − 中』の平均差は {round(edge):+,.0f}枚。"
-                    "店ごとにも調べましたが、端に偏らせている店は偶然の範囲より"
-                    "むしろ少なく、多くの店は端を特別扱いしていません。"
-                    "端の台は回転数も少なめで、座られにくい席です。"
-                    "なお、ここでいう「端」は機種の並びの端で、島の物理的な角とは"
-                    "9割以上一致しません（台番の飛びと機種の切り替わりの一致率 5.6%）。"})
+               "a": "角に設定が高く入っている証拠はありません。全国ではむしろ 0.1 設定ほど低く、"
+                    "角2・角3 は中の台と同じです",
+               "d": "ジャグラーの「同じ機種が連番で並ぶ島」(6台以上) を 25万島日、2026年9月に調べ直しました。"
+                    "角は負けていても長く打たれる席なので (大負けの台で回転数が中の 1.14 倍、大勝ちの台では "
+                    "1.00 倍)、そのまま比べると数字が歪みます。島の全台が 2,000 回転以上回された "
+                    "約4.2万島日に絞ると角と中の回転数がそろい、角は中より出玉率で 0.2〜0.4pt "
+                    "(1台1日 −25〜−60枚、約 −0.1 設定) 低く、イベント日も通常日も同じでした。"
+                    "角2・角3 は中と ±0.08pt 以内で差がありません。"
+                    "店ごとに見ても、角を中より甘くしている店は 11 店で偶然の期待 16 店を下回ります "
+                    "(イベント日の 3 割で角に設定6を置く店があれば 76% の確率で見つかる方法です。"
+                    "1 割以下の頻度なら見つけられません)。"
+                    f"参考: イベント日の『機種の並びの端 − 中』の単純な平均差枚は {round(edge):+,.0f}枚。"
+                    "「端」は機種の並びの端で、島の物理的な角と一致しない場合があります。"
+                    "隣が片側しかない快適さは本物で、それを理由に角に座るのは合理的です。"
+                    "設定の面では角・角2・角3・中のどこに座っても期待値は変わりません。"})
     # 新台
     new = (G.get("new_mai"), G.get("mature_mai"))
     # 「新台に入れる店もある」は撤回した (2026-09-04, Issue #3 項目6)。
@@ -2444,6 +2501,7 @@ try:
         page = "店舗"
 except Exception:
     pass
+track_source()                                   # セッションに1回だけ (#45)
 if st.session_state.get("_last_page") != page:   # 切り替わったときだけ記録
     st.session_state["_last_page"] = page
     track("page", page)
@@ -2875,14 +2933,19 @@ elif page == "店舗":
             if st.checkbox("◎本命機種のある店のみ", key="hon_hd"):
                 ranked = ranked[ranked["hall"].isin(honmei_halls())]
             st.caption("「◎本命機種」= +300枚/台クラスの機種。")
-            # 末尾・角・連続投入は表示だけ過去形にする (値は内部キーのまま)。
-            # バッジと同じ判断: 固める店は見つからなかったが、数字は事実として残す
+            # 末尾・連続投入は表示だけ過去形にする (値は内部キーのまま)。
+            # バッジと同じ判断: 固める店は見つからなかったが、数字は事実として残す。
+            # 「角」は #73 (2026-09-06) で予測力ゼロ (角は中より -0.1 設定、癖の店も無し) と出たので
+            # 絞り込みから外した。表示 (端が出ていた) と内部キー "角(並びの端)" は事実の記録として残す
+            if st.session_state.get("hd_feat") == "角":      # 選択肢から消えた値が残っていると radio が落ちる
+                st.session_state["hd_feat"] = "すべて"
             feat = st.radio("特徴で絞り込み",
-                            ["すべて", "末尾", "角", "連続投入", "曜日", "ジャグラー", "AT機", "新台"],
+                            ["すべて", "末尾", "連続投入", "曜日", "ジャグラー", "AT機", "新台"],
                             horizontal=True, key="hd_feat",
                             format_func=lambda v: _FEAT_LABEL.get(v, v))
             st.caption("店の設定配分の癖 (偏りがはっきりした店) で絞ります。"
-                       "末尾・端・隣は過去の記録で、次を予測する根拠ではありません。")
+                       "末尾・隣は過去の記録で、次を予測する根拠ではありません。"
+                       "角は全国検証で設定差なしと出たため絞り込みから外しました。")
         if feat != "すべて":
             # 内部キー (hall_traits の name) で照合する (2026-09-04)。
             # 以前は hall_badges の表示文字列を startswith で見ていたが、バッジを
@@ -3433,9 +3496,10 @@ elif page == "店舗":
             st.dataframe(ev.style.map(color_mai, subset=["並びの端 枚/台", "中の台 枚/台"])
                          .format({"並びの端 枚/台": "{:+,.0f}", "中の台 枚/台": "{:+,.0f}"}),
                          width="stretch")
-            st.caption("同じ機種が連番で並ぶ列の両端 と 中の台 の平均差枚。端の方が緑が濃い店は"
-                       "並びの端に高設定を置く傾向。※これは「機種の並びの端」であり、島全体の"
-                       "物理的な角台とは限りません (台番の並びからの推定)。")
+            st.caption("同じ機種が連番で並ぶ列の両端 と 中の台 の平均差枚 (この店の過去の記録)。"
+                       "全国 4.2万島日の検証では角は中より設定が高くなく (約 −0.1 設定)、角2・角3 は中と同じ、"
+                       "角に固める癖の店も検出されていません (検証ページ参照)。次を狙う根拠ではありません。"
+                       "※「端」は機種の並びの端で、島全体の物理的な角台とは限りません (台番の並びからの推定)。")
             posdf = q("""SELECT kind, pos, mai, n FROM hall_edge_pos
                          WHERE hall=? ORDER BY kind, pos""", (hsel,))
             if not posdf.empty:
@@ -3449,8 +3513,9 @@ elif page == "店舗":
                                          sort=False).reindex(list(plab.values())).dropna(how="all")
                     st.dataframe(tbl.style.map(color_mai).format("{:+,.0f}", na_rep="—"),
                                  width="stretch")
-                    st.caption("角から数えた位置ごとの平均差枚。角だけ甘い店/角寄りの数台に"
-                               "散らす店/交互に置く店などの癖が見えます (長い並びのみ集計)。")
+                    st.caption("角から数えた位置ごとの平均差枚 (長い並びのみ集計、過去の記録)。"
+                               "全国では位置による設定差は検出されていないので、ここの差は誤差の範囲と"
+                               "考えてください。")
 
         st.markdown("**隣も高設定になりやすいか (連続投入)**")
         nb = q("""SELECT kind, p_cond, p_base FROM hall_neighbor_stats WHERE hall=?""", (hsel,))
