@@ -1,0 +1,26 @@
+# ホールスコアの配色 (2026-09-01)
+#
+# 方向性: 明るい地にうっすら緑を敷き、白いカードをやめる。
+#   白一色だと面積が広くて目が疲れ、地とカードの区別も付きにくかった。
+#   緑を選んだのは、差枚のプラス表示や「出ている」という感覚と地続きにするため。
+#   アクセントの深緑は数字の強調に使い、赤は損失側だけに残す。
+#
+# 既定の Streamlit そのままの見た目だったのを、ここで土台から変える。
+# 個別の作り込みは app_v2.py の CSS 側で行う。
+
+[theme]
+base = "light"
+primaryColor = "#14532d"              # 深緑。数字の強調と選択状態
+backgroundColor = "#e6ebe7"           # 地。カードとの段差を出すため一段濃くした
+secondaryBackgroundColor = "#f8fbf9"  # カード面。地よりはっきり明るく
+textColor = "#191c22"
+# 和欧を1組に固定する。既定のままだと Streamlit 同梱の欧文しか読まれず、
+# 「BIGディッパー木場店」の BIG だけ別書体、という混植が全行で起きていた。
+# 適用は config 経由にする (CSS の * 指定はアイコンフォントを壊す)。
+font = "Inter, 'Noto Sans JP', system-ui, sans-serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
