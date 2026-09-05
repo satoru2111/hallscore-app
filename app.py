@@ -32,9 +32,6 @@ except Exception as _e:      # 黙って空DBを掴ませない。原因をそ�
     st.stop()
 
 
-@st.cache_data(ttl=600)
-
-
 @st.cache_data(ttl=1800)
 def nodata_halls() -> pd.DataFrame:
     """みんパチにあって差枚データが無い店。掲載店には数えない (2026-09-03)."""
@@ -2058,10 +2055,31 @@ div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_cont
      iPhone  390px: 使える幅 366 − 36 → 330px / 20字 = 16.5px 上限 → 1.0rem
    デスクトップは全幅に広げない (700px に広がると間延びする)。
    キーで狙う (Streamlit は key を st-key-<key> クラスでコンテナに付ける) */
+/* 🚨 2026-09-05 (#35): Android の LINE アプリ内 WebView で全項目が「…」になっていた。
+   下の px 計算は「特定フォントで1文字16px」という前提で、実際の描画幅がそれを超えると
+   min-width:0 + flex:1 1 auto により全ボタンが一斉に潰れて全部が省略記号になる。
+   一部でなく全部が消えるのがこの構造の症状。対策を3層にしてある:
+     A. text-size-adjust  … Android WebView の font boosting (自動文字拡大) を止める。
+                             CSS 指定より大きく描画されると font-size を下げても追いつかない
+     B. clamp()           … 階段状の @media をやめ、幅に比例して連続的に縮める
+     C. flex:0 0 auto + overflow-x … それでも入らなければ潰さず横スクロール。
+                             A・B で収まる環境では発動しない
+   C を残す理由: これは「文字幅を px で見積もる」設計が環境の増加で破綻した不具合で、
+   A も B も見積もりである以上また外れる。C だけが見積もりに依存しない保険。 */
+[class*="st-key-page"] {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
 [class*="st-key-page"] div[data-testid="stButtonGroup"] > div {
   gap: 8px !important;
   border-bottom: 1px solid #c9d6cc;
   flex-wrap: nowrap !important;
+  overflow-x: auto;               /* 収まらなければ潰さずスワイプ */
+  scrollbar-width: none;          /* 帯を出さない (Firefox) */
+  -ms-overflow-style: none;
+}
+[class*="st-key-page"] div[data-testid="stButtonGroup"] > div::-webkit-scrollbar {
+  display: none;                  /* Chrome/Safari */
 }
 [class*="st-key-page"] div[data-testid="stButtonGroup"] button {
   background: transparent !important;
@@ -2071,12 +2089,21 @@ div[data-testid="stButtonGroup"] button[data-testid="stBaseButton-segmented_cont
   box-shadow: none !important;
   padding: 9px 5px !important;    /* 3px は詰まりすぎ (ユーザー指摘) → 5px */
   min-height: 42px !important;
-  min-width: 0 !important;
+  /* min-width: 0 は外した (#35)。これがあると内容より小さく潰れて省略記号になる */
+  flex: 0 0 auto !important;      /* 自然幅を保つ。足りなければ縮めずスクロール */
   margin: 0 !important;
 }
 [class*="st-key-page"] div[data-testid="stButtonGroup"] button p,
 [class*="st-key-page"] div[data-testid="stButtonGroup"] button div {
-  font-size: 1.0rem !important;
+  /* 幅に比例して連続的に縮める (#35)。以前は 1.05rem / @media 480px→1.0rem /
+     @media 400px→.95rem の階段状で、段の間の幅や想定外の環境に合わなかった。
+     係数 3.9vw は 09-04 に実機で決めた値を再現するように逆算した:
+       iPhone 390px → 15.2px = .95rem  (09-04 の実測値と一致)
+       Android 412px → 16.1px → 上限 1.0rem で頭打ち (同上)
+       320px の小型機 → 12.5px → 下限 .78rem
+       デスクトップ → 上限 1.0rem。全幅に広げず間延びさせない
+     下限 .78rem は「6項目20文字 + 余白が 320px 幅に収まる」ための値 */
+  font-size: clamp(.78rem, 3.9vw, 1.0rem) !important;
   /* 未選択の色と太さ (2026-09-04、ユーザー指摘2回で中間に落ち着いた):
        #6b7280/700 → 「濃くて、下線があるからまだ分かるけど」
        #9aa3ad/500 → 「薄すぎて視認しにくい」
@@ -2106,23 +2133,20 @@ div[data-testid="stElementContainer"][class*="st-key-page"] {
   background: #e6ebe7 !important;
   padding-top: 4px !important;
 }
-/* スマホ: 幅いっぱいに広げる。閾値 480px は Android 412px / iPhone 390px の両方を含む
-   (400px では Android で発火しなかった、2026-09-04 実機) */
+/* スマホ: 隙間を詰めて端から端まで使う。閾値 480px は Android 412px / iPhone 390px の
+   両方を含む (400px では Android で発火しなかった、2026-09-04 実機)。
+
+   🚨 2026-09-05 (#35): ここにあった `flex: 1 1 auto !important` と font-size の
+   上書き2段を削除した。前者は上の `flex: 0 0 auto` を**スマホでだけ打ち消して**
+   ボタンを潰し、Android LINE の WebView で全項目を「…」にしていた。まさに壊れる幅で
+   壊れる指定が入っていた。後者は clamp() に置き換え済み (ここで上書きすると効かない)。
+   残すのは隙間と配置だけ。ボタンが収まるときは space-between で端まで広がり、
+   収まらないときは上の overflow-x でスワイプになる */
 @media (max-width: 480px) {
   [class*="st-key-page"] div[data-testid="stButtonGroup"] > div {
     gap: 0 !important;
     justify-content: space-between !important;
   }
-  [class*="st-key-page"] div[data-testid="stButtonGroup"] button { flex: 1 1 auto !important; }
-  /* 1.05rem/余白3px は「詰まりすぎ」(ユーザー指摘)。文字を 1.0rem に戻して余白 5px に。
-     412px: 16px×20字=320 + 5px×12=60 → 380px < 388px */
-  [class*="st-key-page"] div[data-testid="stButtonGroup"] button p,
-  [class*="st-key-page"] div[data-testid="stButtonGroup"] button div { font-size: 1.0rem !important; }
-}
-/* iPhone 幅 (390px、使える幅 366px): 15.2px×20字=304 + 60 → 364px */
-@media (max-width: 400px) {
-  [class*="st-key-page"] div[data-testid="stButtonGroup"] button p,
-  [class*="st-key-page"] div[data-testid="stButtonGroup"] button div { font-size: .95rem !important; }
 }
 /* --- 折りたたみ: カードと同じ白。背景は details と中身の両方に当てる --- */
 div[data-testid="stExpander"] details,
