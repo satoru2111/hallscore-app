@@ -20,6 +20,8 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import unit_judge  # 台ごとの設定判別 (#163)。公開アプリにも sync_public_app.py で運ぶ
+
 ROOT = Path(__file__).parent
 # 公開配信 (Streamlit Cloud) 用。R2 から serve.db を取得する。
 # このブロックだけが本体 app_v2.py との差分 (scripts/sync_public_app.py が生成)
@@ -1683,6 +1685,212 @@ def hall_url(hall: str) -> str:
     return "?" + urllib.parse.urlencode(keep)
 
 
+@st.cache_resource
+def _unit_judge_specs():
+    return unit_judge.load_specs()
+
+
+@st.cache_data(ttl=3600)
+def _machine_setting_mix() -> dict[str, dict]:
+    """機種ごとの実測配分 (scripts/build_machine_setting_mix.py).
+
+    返り値: {機種: {"full": 全期間の配分, "parts": [日ごとの配分 ...], "show_hourly": bool,
+                    "allow_fire": bool, "allow_ice": bool}}。
+    日ごとの配分が MIN_DAYS 日そろっていない機種、フラグ列の無い古い表は入れない (出す根拠を確かめていない)。
+    フラグは全行が 1 のときだけ True (5回目のレビュー: 最後に読んだ行で決めていた)。
+    """
+    min_days = unit_judge.MIN_DAYS_FOR_RANGE   # build_machine_setting_mix.MIN_DAYS と同じ値 (unit_judge で共有)
+    if not _table_exists("machine_setting_mix"):
+        return {}
+    cols = set(q("SELECT name FROM pragma_table_info('machine_setting_mix')")["name"])
+    if not {"part", "show_hourly", "allow_fire", "allow_ice"} <= cols:
+        return {}
+    df = q("SELECT machine_key, part, weights, show_hourly, allow_fire, allow_ice FROM machine_setting_mix "
+           "WHERE converged = 1 ORDER BY machine_key, part")
+    by: dict[str, dict[int, list[float]]] = {}
+    flags: dict[str, dict[str, bool]] = {}
+    for _, r in df.iterrows():
+        try:
+            w = [float(x) for x in json.loads(r["weights"])]
+        except (TypeError, ValueError):
+            continue
+        if not (w and abs(sum(w) - 1) < 1e-3 and all(x > 0 for x in w)):
+            continue
+        by.setdefault(r["machine_key"], {})[int(r["part"])] = w
+        f = flags.setdefault(r["machine_key"], {"show_hourly": True, "allow_fire": True, "allow_ice": True})
+        for c in f:
+            f[c] = f[c] and r[c] == 1
+    out = {}
+    for k, parts in by.items():
+        idx = sorted(parts)
+        if 0 in parts and len(idx) >= min_days + 1 and idx == list(range(len(idx))):
+            out[k] = {"full": parts[0], "parts": [parts[i] for i in idx if i > 0], **flags[k]}
+    return out
+
+
+def _yen_range(lo: float, hi: float) -> str:
+    # 単位の「円」は列の見出しに出す。412px 幅で「+490〜+570円」が切れたため (2026-09-15 実測)
+    lo, hi = round(lo, -1), round(hi, -1)
+    return f"{lo:+,.0f}" if lo == hi else f"{lo:+,.0f}〜{hi:+,.0f}"
+
+
+def _pct_range(lo: float, hi: float) -> str:
+    lo, hi = round(lo * 100), round(hi * 100)
+    return f"{lo}%" if lo == hi else f"{lo}〜{hi}%"
+
+
+def _validation_note(machine: str) -> str:
+    """「この数字の見かた」に出す検証結果の一文 (数字は unit_judge.VALIDATION_SUMMARY)."""
+    v = unit_judge.VALIDATION_SUMMARY.get(machine)
+    if not v:
+        return ""
+    return (f"- **検証**: 過去の日だけで作った範囲に、その後の日の「その日の実測配分で計算し直した設定4以上」が"
+            f"入ったのは {v[0]:.0f}%（日数では {v[3]}日中{v[2]}日）。範囲より悪かった（画面が甘く出た）のは {v[1]:.0f}%\n")
+
+
+def render_unit_judge() -> None:
+    """打っている台の G数・BIG・REG から設定の見込みを出す (#163).
+
+    入力値は保存しない。データサイト由来の数字を集める側に回らないため。
+    記録するのは「判別を使った」ことと機種名だけ。
+
+    事前分布は機種ごとの実測配分 (machine_setting_mix)。一様や店の平均設定からの配分は甘かったので使わない。
+    機種全体の高設定の割合は日によって大きく動くので、直近の日ごとの配分 (9〜21日) それぞれで計算し、
+    その 10〜90% を範囲で出す (案A、ユーザー判断)。範囲の当たり率・甘い側への外れ・ラベルの正しさは u1 第6版で検証。
+    ラベル (🔥/👀/🧊/😐) は範囲の下限・上限から機械的に決める。言葉は強く、数字と矛盾させない
+    (docs/unit_judge_prior_20260914.md)。注意書きは「この数字の見かた」に畳む。
+    配分が無い機種 (ハナハナなど) は、ラベル・設定4以上・期待時給を出さない。
+    """
+    specs, alias, meta = _unit_judge_specs()
+    mix = _machine_setting_mix()
+    groups = ["ジャグラー", "ハナハナ"]
+    keys = [k for g in groups for k, s in specs.items() if s.group == g]
+    mk = st.selectbox("機種", keys, key="uj_machine")
+    spec = specs[mk]
+    m = mix.get(mk)
+    if m is not None and any(len(w) != spec.n for w in [m["full"]] + m["parts"]):
+        m = None
+
+    # 店は交換率にだけ使う。店による設定の違いは、正しさを確かめられていないので使わない
+    hx = halls.dropna(subset=["slot_exchange_mai"])
+    lab = {(f"{r['hall']}（{r['city']}）" if isinstance(r["city"], str) and r["city"]
+            else r["hall"]): float(r["slot_exchange_mai"]) for _, r in hx.iterrows()}
+    # 中央値は範囲内 (4.5〜7.5枚) の店だけで取る。DB には 460枚・4000枚 などの誤りがある
+    ok_mai = [x for x in lab.values() if unit_judge.valid_exchange(x)]
+    median_mai = float(pd.Series(ok_mai).median()) if ok_mai else None
+    none_lab = (f"選ばない（交換率 {median_mai:g}枚 = 全店の中央値で換算）" if median_mai
+                else "選ばない（等価で換算）")
+    hl = st.selectbox("打っている店（交換率に使います）", [none_lab] + sorted(lab), key="uj_hall")
+    mai = lab.get(hl)
+    if mai is not None and not unit_judge.valid_exchange(mai):
+        st.caption(f"この店の交換率 {mai:g}枚 は誤りの可能性が高いため、全店の中央値で換算します。")
+        mai = None
+    win_yen = unit_judge.yen_per_coin_from_exchange(mai, median_mai)
+
+    st.caption("台ごとに G数・BIG・REG を入れて「判別する」（行は追加できます）。入力した数字は保存しません。")
+    # フォームで囲む: data_editor は1マスごとに再実行が走り、続けて打った数字が消える
+    # (2026-09-14 実測)。列を文字列にするのは、数値列だと空欄が「None」と表示されるため
+    blank = pd.DataFrame({c: pd.Series([""] * 3, dtype="str")
+                          for c in ("台番", "G数", "BIG", "REG")})
+    with st.form(f"uj_form_{mk}", border=False):
+        ed = st.data_editor(blank, num_rows="dynamic", hide_index=True, width="stretch",
+                            key=f"uj_rows_{mk}",
+                            column_config={c: st.column_config.TextColumn(c)
+                                           for c in ("台番", "G数", "BIG", "REG")})
+        st.form_submit_button("判別する", type="primary", width="stretch")
+
+    out, errs, ranges, posts_u, g_sum, b_sum = [], [], [], [], 0, 0
+    for i, r in ed.iterrows():
+        raw = [unit_judge.cell_text(r.get(c)) for c in ("G数", "BIG", "REG")]
+        if not any(raw):
+            continue
+        name = (unit_judge.cell_text(r.get("台番")) or f"{i + 1}行目")[:20]
+        if not all(raw):
+            errs.append(f"{name}: G数・BIG・REG をすべて入れてください")
+            continue
+        try:
+            g, bb, rb = (unit_judge.parse_count(x) for x in raw)
+            if m is not None:
+                res = unit_judge.judge_range(bb, rb, g, spec, m["parts"], win_yen,
+                                             allow_high=m["allow_fire"], allow_low=m["allow_ice"])
+            else:
+                post = unit_judge.posterior(bb, rb, g, spec)
+        except (ValueError, OverflowError) as e:
+            errs.append(f"{name}: {e}")
+            continue
+        g_sum += g
+        b_sum += bb + rb
+        if m is not None:
+            ranges.append(res)
+            row = {"台番": name, "判定": res["label"],
+                   "設定4以上": _pct_range(res["p_high_min"], res["p_high_max"])}
+            if m["show_hourly"]:
+                row["時給(円)"] = _yen_range(res["hourly_min"], res["hourly_max"])
+            out.append(row)
+        else:
+            posts_u.append(post)
+            row = {"台番": name, "合算": f"1/{g / (bb + rb):.0f}" if bb + rb else "—"}
+            row.update({f"設定{s}": f"{p * 100:.0f}%" for s, p in zip(spec.settings, post)})
+            out.append(row)
+    for e in errs:
+        st.warning(e)
+    if not out:
+        return
+
+    track_once("judge", mk)
+    df = pd.DataFrame(out)
+    if m is not None:
+        # 表 (st.dataframe) ではなく台ごとに2行のテキストで出す。キャンバス描画の表は 412px 幅で
+        # 4列目 (時給) が切れ、列幅の指定でも収まらなかった (2026-09-15 実測)。テキストは折り返す
+        for row in out:
+            line2 = f"設定4以上 **{row['設定4以上']}**"
+            if "時給(円)" in row:
+                line2 += f" ・ 時給 **{row['時給(円)']}円**"
+            # 台番はユーザー入力。markdown の記号 ($ は数式、: は絵文字の短縮記法) を落とし、前後の空白も削る
+            no = re.sub(r"[*_`\[\]()#<>|\\~$:]", "", row["台番"]).strip() or "—"
+            st.markdown(f"**{no}**　{row['判定']}  \n{line2}")
+        if len(out) >= 2:
+            # 入力した台の「設定4以上の見込み」の平均も、日ごとの配分それぞれで出して 10〜90% の範囲にする
+            hf = spec.high_from()
+            means = [sum(sum(r["posts"][j][hf:]) for r in ranges) / len(ranges)
+                     for j in range(len(m["parts"]))]
+            lo, hi = (unit_judge.quantile(means, qq) for qq in unit_judge.RANGE_Q)
+            st.markdown(f"**入力した{len(out)}台まとめ** ｜ 平均 {g_sum / len(out):,.0f}G"
+                        + (f" ・ 合算 1/{g_sum / b_sum:.0f}" if b_sum else "")
+                        + f" ・ 設定4以上の見込み {_pct_range(lo, hi)}")
+        st.caption("範囲 = 日によって変わる機種全体の設定配分で計算し直した幅（8割の日がこの中）です。")
+        with st.expander("この数字の見かた"):
+            mw = sum(p * w for p, w in zip(m["full"], spec.wari))
+            rate = f"交換率 {mai:g}枚" if mai else (f"交換率 {median_mai:g}枚（全店の中央値）"
+                                                    if median_mai else "等価")
+            st.markdown(
+                "- **判定**: 🔥 高設定の可能性大 = 9割の日で設定4以上が50%以上 ／ "
+                "👀 高設定の目あり = 設定4以上が30%以上になる日がある ／ 🧊 低設定濃厚 = 9割の日で設定1〜3が90%以上"
+                + ("" if m["allow_fire"] and m["allow_ice"] else
+                   "（この機種はまだ" + "・".join(x for x, ok in (("🔥", m["allow_fire"]), ("🧊", m["allow_ice"])) if not ok)
+                   + " を付けられるだけの検証データがないので付けていません）") + "\n"
+                f"- **土台**: 収集した店の実測では、{mk} の平均機械割は {mw:.1f}%。"
+                "台のデータが少ないほど、この平均に近い結果になります。"
+                "機種全体の高設定の割合は日によって大きく変わる（イベント日など）ので、1つの値ではなく範囲で出しています\n"
+                + (f"- **期待時給**: {meta['games_per_hour']}G/時・メーカー公表の機械割。増えるメダルは{rate}、"
+                   "減るメダルは1枚20円（換金単価のほうが高ければそちら）で換算。"
+                   "現金で借りたメダルの目減りは入れていないので、その分は実際より良く出ます\n"
+                   if m["show_hourly"] else
+                   "- **期待時給**: この機種は、時給の範囲が検証の基準（当たり率70%）に届かなかったため出していません\n")
+                + _validation_note(mk)
+                + "- 設定の見込みだけの期待値で、その日の引きのぶれは入っていません。当たりを保証するものではありません")
+    else:
+        # 「最有力」やラベルは出さない。一様の前提から出した判定はもっともらしく見えるため、確率の表だけにする
+        st.dataframe(df, hide_index=True, width="stretch")
+        # ジャグラーガールズSS・ハッピージャグラーV3 (u1 第6版で不合格)、ウルトラミラクル (評価不足)、ハナハナ (データなし) がここに来る
+        st.caption(f"{mk} はまだ判定と期待時給を出せる根拠がそろっていないため、確率の表だけです。")
+        with st.expander("この数字の見かた"):
+            st.markdown(
+                "- 上の確率は**どの設定も同じ割合で入っている前提**で計算しています\n"
+                "- ジャグラーの実測では低設定の台が多いので、この表は高設定寄りに出ている可能性が高いです\n"
+                "- 当たりを保証するものではありません")
+
+
 def back_to_list() -> None:
     st.session_state.hall_pick = None
     st.session_state.hd_search = None
@@ -2905,6 +3113,16 @@ elif page == "ランキング":
 # ランキングの「並べ方」の1つではなく独立した入口にした (2026-09-02)
 
 elif page == "ジャグラー":
+    # 台ごとの判別 (#163)。ホールで打つたびに使う機能なので先頭に置くが、
+    # 店のランキングを初画面から押し出さないよう折りたたむ
+    # 見出しに絵文字を付けない (ヘッドレス Chromium で □ に化けた、2026-09-14)
+    with st.expander("打っている台を判別する（ジャグラー・ハナハナ）", expanded=False):
+        try:
+            render_unit_judge()
+        except Exception as _e:   # 判別欄の不具合で店のランキングまで落とさない
+            st.error("台の判別でエラーが起きました。お手数ですが入力を見直してください")
+            # 型名だけ残す。例外の文面には入力したセルの値が混ざりうる (入力値は保存しない方針)
+            print(f"render_unit_judge error: {type(_e).__name__}", flush=True)
     st.markdown("##### ジャグラーが甘い店")
     st.caption("BIG/REG の出方から1台ずつ設定を推定し、店ごとに平均したものです。"
                "AT機は出玉から設定を読めませんが、ジャグラーは読めます。")
@@ -3545,13 +3763,23 @@ elif page == "店舗":
         else:
             # 「イベント日に行くならどの末尾か」「通常日ならどの末尾か」は独立した2軸。
             # 差ではなく、それぞれの日の実際の台あたり平均差枚を並べる
-            view = pd.DataFrame({"末尾": tails["tail"].astype(int),
-                                 "イベント日 枚/台": tails["ev_mai"].round(0),
-                                 "通常日 枚/台": tails["ct_mai"].round(0)}).sort_values("末尾")
+            # 数値に変換してから丸める。通常日のデータが無い店 (約850店) は ct_mai が全部 NULL で、
+            # 列が数値でなく None だけの列として読まれ、.round(0) が TypeError でページごと落ちていた (2026-09-15)
+            cols = {"末尾": tails["tail"].astype(int),
+                    "イベント日 枚/台": pd.to_numeric(tails["ev_mai"], errors="coerce").round(0),
+                    "通常日 枚/台": pd.to_numeric(tails["ct_mai"], errors="coerce").round(0)}
+            # 通常日のデータが全部無い店は列ごと外す。st.dataframe は Styler の na_rep を使わず「None」と出すため
+            no_ct = cols["通常日 枚/台"].isna().all()
+            if no_ct:
+                cols.pop("通常日 枚/台")
+            num_cols = [c for c in cols if c != "末尾"]
+            view = pd.DataFrame(cols).sort_values("末尾")
             st.dataframe(view.style
-                         .map(color_mai, subset=["イベント日 枚/台", "通常日 枚/台"])
-                         .format({"イベント日 枚/台": "{:+,.0f}", "通常日 枚/台": "{:+,.0f}"}),
+                         .map(color_mai, subset=num_cols)
+                         .format({c: "{:+,.0f}" for c in num_cols}, na_rep="—"),
                          width="stretch", hide_index=True)
+            if no_ct:
+                st.caption("この店は通常日の末尾データがまだありません。")
             st.caption("行く日のタイプの列だけを見て、緑の濃い末尾を狙う (2つの列は別々の狙い方)。"
                        "数字は実際の1台あたり平均差枚。")
 
