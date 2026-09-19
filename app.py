@@ -12,6 +12,7 @@ import json
 import math
 import re
 import sqlite3
+import hashlib
 import urllib.parse
 import urllib.request
 import os
@@ -156,6 +157,12 @@ def hall_result_card(hall: str, nodata: bool) -> None:
         if not jr.empty and pd.notna(jr["mean_setting"].iloc[0]):
             v = jr["mean_setting"].iloc[0]
             bits.append(f"ジャグラー **{v:.2f}**（{juggler_label(v)}）")
+        for _sr in (("ハナハナ", "ハナビ") if _table_exists("hall_series_stats") else ()):
+            sr = q("""SELECT mean_setting FROM hall_series_stats
+                      WHERE series=? AND hall=? AND n_unit_days >= ?""", (_sr, hall, SERIES_MIN_N[_sr]))
+            if not sr.empty and pd.notna(sr["mean_setting"].iloc[0]):
+                v = sr["mean_setting"].iloc[0]
+                bits.append(f"{_sr} **{v:.2f}**（{series_label(_sr, v)}）")
         st.markdown(" ・ ".join(bits) if bits else "この店の集計はまだ準備中です。")
         if (ln := _basic_line(h)):
             st.caption(f"🚪 {ln}")
@@ -217,6 +224,43 @@ def jug_rank() -> tuple[dict, int]:
     # 上位 x%。1位なら 1%、最下位なら 100%
     return {r["hall"]: max(1, round(100 * (i + 1) / n))
             for i, r in d.iterrows()}, n
+
+
+# ハナハナ系・ハナビ系の店平均設定 (#178)。ジャグラーと同じ作りで系統ごとにまとめる。
+# 店の比較に出す下限の台日数。validate_metric.py で信頼性 0.80 を満たす最小 n (#178, 2026-09-19):
+#   ハナハナ 0.776 (n>=100) → 0.831 (n>=200) / ハナビ 0.836 (n>=100)
+# 主指標 (前半の上位1割と下位1割の後半の差) はハナハナ +0.3〜0.4・ハナビ +0.3 で、ジャグラー (+0.2〜0.3) と同等以上
+SERIES_MIN_N = {"ハナハナ": 200, "ハナビ": 100}
+SERIES_NOTE = {
+    # ハナビ系は打ち手の技量 (リプレイハズシ) でも差枚が変わる。常連の腕が店の数字に混ざる
+    "ハナビ": "打ち手の技量も数字に混ざります",
+}
+
+
+@st.cache_data(ttl=1800)
+def series_rank(series: str) -> tuple[dict, pd.Series]:
+    """系統ごとの順位 (上位x%) と、ラベル判定用の全店の値."""
+    if not _table_exists("hall_series_stats"):
+        return {}, pd.Series(dtype=float)
+    d = q("""SELECT hall, mean_setting FROM hall_series_stats
+             WHERE series = ? AND n_unit_days >= ? AND mean_setting IS NOT NULL""",
+          (series, SERIES_MIN_N[series]))
+    if d.empty:
+        return {}, pd.Series(dtype=float)
+    d = d.sort_values("mean_setting", ascending=False).reset_index(drop=True)
+    n = len(d)
+    return ({r["hall"]: max(1, round(100 * (i + 1) / n)) for i, r in d.iterrows()},
+            d["mean_setting"])
+
+
+def series_label(series: str, v: float) -> str:
+    """juggler_label と同じ区切り (上位10/25/75/90%) を、その系統の店の中で当てる."""
+    allv = series_rank(series)[1]
+    if allv.empty or v is None or pd.isna(v):
+        return ""
+    above = (allv > v).mean()
+    return ("激甘" if above <= 0.10 else "甘め" if above <= 0.25 else
+            "ふつう" if above <= 0.75 else "辛め" if above <= 0.90 else "激辛")
 
 
 
@@ -696,6 +740,159 @@ def _table_exists(name: str) -> bool:
     """
     return not q("SELECT name FROM sqlite_master WHERE type='table' AND name=?",
                  (name,)).empty
+
+
+MX_SYM = {"全台系": ("全", "#14532d", "#fff"), "高配分": ("高", "#dcecdf", "#14532d"),
+          "並び": ("並", "#fdf0d5", "#7a4b00"), "-": ("-", "", "#9aa3a0")}
+MX_NOTE = ("推定です。全 = 全台系（3台以上・全台プラス・平均3,000G以上）、"
+           "高 = 高配分（2台以上・6割以上プラス・平均+500枚以上・平均3,000G以上）、"
+           "並 = 並び（同じ機種で台番が連続する3台以上が +1,000枚以上）、空欄 = その日は無かった。"
+           "設定を確かめたものではありません。")
+
+
+def matrix_html(rows, max_machines: int = 15) -> str:
+    """hall_event_matrix の1店×1旧イベ日ぶん [(date, machine, n, avg, label)] を表にする (#187).
+
+    機種は「何か入った回数」が多い順。列は新しい日が左。
+    """
+    dates = sorted({r[0] for r in rows}, reverse=True)
+    cell: dict = {}
+    for d, m, n, avg, lab in rows:
+        cell[(m, d)] = (lab, n, avg)
+    hits = {}
+    for (m, d), (lab, _n, _a) in cell.items():
+        hits[m] = hits.get(m, 0) + (lab != "-")
+    latest = {m: cell.get((m, dates[0]), ("-", 0, 0))[2] for m in hits}
+    ms = sorted(hits, key=lambda m: (-hits[m], -latest[m]))[:max_machines]
+    head = "".join(f"<th>{int(d[5:7])}/{int(d[8:10])}</th>" for d in dates)
+    body = ""
+    for m in ms:
+        tds = ""
+        for d in dates:
+            c = cell.get((m, d))
+            if not c:
+                tds += "<td></td>"
+                continue
+            sym, bg, fg = MX_SYM[c[0]]
+            st = f"background:{bg};" if bg else ""
+            tds += (f'<td style="text-align:center;{st}color:{fg};font-weight:700" '
+                    f'title="{c[1]}台 平均{c[2]:+,}枚">{sym}</td>')
+        body += f"<tr><td>{_h.escape(m)}</td>{tds}</tr>"
+    return (f'<div style="overflow-x:auto"><table><tr><th>機種</th>{head}</tr>{body}</table></div>'
+            f'<p class="meta" style="font-size:.78rem">{MX_NOTE}</p>')
+
+
+# ---------- お気に入り (#188) ----------
+# ログインは入れない。お気に入りの店は URL の ?fav= に店 ID (静的ページと同じ md5 先頭10桁) で持ち、
+# そのページをブックマークしてもらう。毎朝ブックマークを開くと、先頭にお気に入りの店の今日が出る。
+# cookie / localStorage は Streamlit 標準では読めず、部品を足すと公開アプリの依存も増えるので使わない
+FAV_MAX = 10
+
+
+def hall_id(hall: str) -> str:
+    return hashlib.md5(hall.encode("utf-8")).hexdigest()[:10]
+
+
+def fav_ids() -> list[str]:
+    try:
+        raw = st.query_params.get("fav", "")
+    except Exception:
+        raw = ""
+    return [x for x in dict.fromkeys(raw.split(",")) if len(x) == 10][:FAV_MAX]
+
+
+def fav_halls() -> list[str]:
+    by_id = {hall_id(h): h for h in halls["hall"]}
+    return [by_id[i] for i in fav_ids() if i in by_id]
+
+
+def _toggle_fav(hall: str) -> None:
+    ids = fav_ids()
+    i = hall_id(hall)
+    ids = [x for x in ids if x != i] if i in ids else (ids + [i])[:FAV_MAX]
+    if ids:
+        st.query_params["fav"] = ",".join(ids)
+    elif "fav" in st.query_params:
+        del st.query_params["fav"]
+    track("fav", hall)
+
+
+def render_favs() -> None:
+    """お気に入りの店の「今日」を先頭にまとめる (#188)。slot-eye・みんレポのお気に入りに当たる."""
+    fh = fav_halls()
+    if not fh:
+        return
+    today = dt.date.today().isoformat()
+    st.markdown("##### ⭐ お気に入りの店")
+    for h in fh:
+        up = q("""SELECT date, rules, oos_state, oos_test_mai, uplift_mai FROM upcoming_days
+                  WHERE hall=? AND date>=? ORDER BY date LIMIT 1""", (h, today))
+        bits = []
+        if not up.empty and up["date"].iloc[0] == today:
+            r = up.iloc[0]
+            rules = "・".join(json.loads(r["rules"] or "[]"))
+            if r["oos_state"] == "both" and pd.notna(r["oos_test_mai"]):
+                bits.append(f"今日は **{rules}**（検証済み・普段より {r['oos_test_mai']:+,.0f}枚/台）")
+            else:
+                bits.append(f"今日は **{rules}**（{OOS_LABEL.get(r['oos_state'], ('データ不足',))[0]}）")
+        elif not up.empty:
+            bits.append(f"次の旧イベ日 {fmt_date(up['date'].iloc[0])}")
+        else:
+            bits.append("今後2週間に旧イベ日はありません")
+        jr = q("SELECT mean_setting FROM hall_juggler_stats WHERE hall=? AND n_unit_days >= 100", (h,))
+        if not jr.empty and pd.notna(jr["mean_setting"].iloc[0]):
+            bits.append(f"ジャグラー {juggler_label(jr['mean_setting'].iloc[0])}")
+        ju = q("""SELECT machine, unit_no FROM juggler_unit_score WHERE hall=? AND rank_in_machine=1
+                  AND dev_setting > 0 ORDER BY n_units DESC LIMIT 1""", (h,))
+        if not ju.empty:
+            bits.append(f"{ju['machine'].iloc[0]} の一番手 {int(ju['unit_no'].iloc[0])}番")
+        st.markdown(card_html(hall_url(h), h, meta=" ・ ".join(bits).replace("**", "")),
+                    unsafe_allow_html=True)
+    st.caption("このページの URL にお気に入りが入っています。**ブックマークしておくと、次に開いたときもそのまま出ます。**"
+               "外すときは店舗詳細の「★ お気に入りから外す」から。")
+
+
+TR_DB = ROOT / "data" / "track_record.db"
+
+
+@st.cache_data(ttl=600)
+def track_weekly() -> pd.DataFrame:
+    """公開トラックレコード (#102) の週次表.
+
+    🚨 この表は本体 DB (fukurou_v2.db) には無い。data/track_record.db にあり、
+       export_serve_db.py が serve.db へ写す。自宅配信 (本体 DB) は q() で読めず、
+       2026-09-19 まで「最初の週次の答え合わせは 09-14 に出ます」のままだった (#190)。
+       配信用 DB にあればそれを、無ければ track_record.db を直接読む。
+    """
+    sql = """SELECT week_start, tier, n_pred, n_real, n_no_report, hit_rate, mean_pt, mean_mai,
+                    base_n, base_hit_rate, base_pt FROM track_record_weekly
+             WHERE tier IN ('both','x_daily') ORDER BY week_start DESC, tier"""
+    if _table_exists("track_record_weekly"):
+        return q(sql)
+    if TR_DB.exists():
+        con = sqlite3.connect(f"file:{TR_DB}?mode=ro", uri=True)
+        try:
+            return pd.read_sql_query(sql, con)
+        except Exception:
+            return pd.DataFrame()
+        finally:
+            con.close()
+    return pd.DataFrame()
+
+
+def track_summary(weeks: int = 8) -> tuple[float, float, int, int] | None:
+    """直近 weeks 週の「検証済みの狙い目」の的中率と基準の的中率 (件数で重み付け)."""
+    trw = track_weekly()
+    if trw.empty:
+        return None
+    r = trw[trw["tier"] == "both"].head(weeks)
+    w = r["n_real"].fillna(0)
+    if r.empty or w.sum() <= 0:
+        return None
+    bw = r["base_n"].fillna(0)
+    hit = float((r["hit_rate"].fillna(0) * w).sum() / w.sum())
+    base = float((r["base_hit_rate"].fillna(0) * bw).sum() / max(bw.sum(), 1))
+    return hit, base, int(w.sum()), len(r)
 
 
 @st.cache_data(ttl=3600)
@@ -1676,7 +1873,7 @@ def hall_url(hall: str) -> str:
     """
     keep = {}
     try:
-        for k in ("scope", "pref", "city", "addr", "radius"):
+        for k in ("scope", "pref", "city", "addr", "radius", "fav"):
             if k in st.query_params:
                 keep[k] = st.query_params[k]
     except Exception:
@@ -1688,6 +1885,41 @@ def hall_url(hall: str) -> str:
 @st.cache_resource
 def _unit_judge_specs():
     return unit_judge.load_specs()
+
+
+BORDER_G = (2000, 3000, 4000, 5000, 6000, 8000)
+BORDER_YEN = (0, 1000, 2000)
+
+
+@st.cache_data(ttl=3600)
+def border_table(mk: str, win_yen: float) -> list[dict]:
+    """期待時給のボーダー表 (#186)。slot-eye の「期待時給ボーダー表」に当たる.
+
+    各 G数で、**時給の範囲の下限** (日ごとの配分で計算した 10% 点) が目標を超える最少の REG 回数。
+    BIG は設定1の確率どおりに引いたとみなす (BIG の引きで甘くならないように)。
+    事前分布は画面の判別と同じ「機種ごとの実測配分」。店ごとの配分は使わない:
+    u1 で店の平均設定から作った配分を試したが、改善の約84%は店をシャッフルしても出る効果で、
+    期待時給は実測より 650円/時 甘かった (docs/unit_judge_prior_20260914.md)。
+    """
+    specs, _alias, _meta = _unit_judge_specs()
+    spec = specs[mk]
+    m = _machine_setting_mix().get(mk)
+    if m is None or not m["show_hourly"]:
+        return []
+    out = []
+    for g in BORDER_G:
+        bb = round(g / spec.bb[0])
+        row = {"G数": g, "BIG": bb}
+        for target in BORDER_YEN:
+            need = None
+            for rb in range(0, g // 150 + 1):
+                r = unit_judge.judge_range(bb, rb, g, spec, m["parts"], win_yen)
+                if r["hourly_min"] >= target:
+                    need = rb
+                    break
+            row[target] = need
+        out.append(row)
+    return out
 
 
 @st.cache_data(ttl=3600)
@@ -1759,11 +1991,15 @@ def render_unit_judge() -> None:
     その 10〜90% を範囲で出す (案A、ユーザー判断)。範囲の当たり率・甘い側への外れ・ラベルの正しさは u1 第6版で検証。
     ラベル (🔥/👀/🧊/😐) は範囲の下限・上限から機械的に決める。言葉は強く、数字と矛盾させない
     (docs/unit_judge_prior_20260914.md)。注意書きは「この数字の見かた」に畳む。
-    配分が無い機種 (ハナハナなど) は、ラベル・設定4以上・期待時給を出さない。
+    配分が無い機種 (ハナハナ・ハナビ) は、ラベル・設定4以上・期待時給を出さない。
+    unit_bonus の実データが集まれば machine_setting_mix が回り、自動でそちら側に移る。
+
+    ハナビ (アクロス系) は設定 1/2/5/6 の4段階で、RT ぶんの薄まりを
+    unit_judge.log_likelihood が周辺化して吸収する (#171)。
     """
     specs, alias, meta = _unit_judge_specs()
     mix = _machine_setting_mix()
-    groups = ["ジャグラー", "ハナハナ"]
+    groups = ["ジャグラー", "ハナハナ", "ハナビ"]
     keys = [k for g in groups for k, s in specs.items() if s.group == g]
     mk = st.selectbox("機種", keys, key="uj_machine")
     spec = specs[mk]
@@ -1786,6 +2022,23 @@ def render_unit_judge() -> None:
         st.caption(f"この店の交換率 {mai:g}枚 は誤りの可能性が高いため、全店の中央値で換算します。")
         mai = None
     win_yen = unit_judge.yen_per_coin_from_exchange(mai, median_mai)
+
+    # 期待時給のボーダー表 (#186)。時給を出してよい機種 (u1 第6版で合格) だけ
+    if m is not None and m["show_hourly"]:
+        with st.expander("📏 期待時給のボーダー表（何回 REG なら打てるか）"):
+            bt = border_table(mk, win_yen)
+            if bt:
+                def _cell(rb, g):
+                    return f"REG {rb}回（1/{g / rb:.0f}）" if rb else ("0回でも" if rb == 0 else "—")
+                st.dataframe(pd.DataFrame([{
+                    "G数": f"{r['G数']:,}G", "BIG (設定1並み)": f"{r['BIG']}回",
+                    **{("時給 ±0円" if y == 0 else f"時給 +{y:,}円"): _cell(r[y], r["G数"])
+                       for y in BORDER_YEN}} for r in bt]), hide_index=True, width="stretch")
+                st.caption("そのG数で REG がこの回数以上あれば、**時給の範囲の下限**が目標を超えます"
+                           "（日によって変わる機種全体の設定配分で計算した幅の、悪いほうの端）。"
+                           "BIG は設定1の確率どおりとみなしています。BIG が多ければもっと甘くなります。"
+                           "交換率は上で選んだ店のものです。— は REG が 1/150 でも届かないという意味です。"
+                           "店ごとの設定の入れ方は使っていません（確かめた結果、当たりが良くならなかったため）。")
 
     st.caption("台ごとに G数・BIG・REG を入れて「判別する」（行は追加できます）。入力した数字は保存しません。")
     # フォームで囲む: data_editor は1マスごとに再実行が走り、続けて打った数字が消える
@@ -2790,6 +3043,9 @@ if st.session_state.get("_last_page") != page:   # 切り替わったときだ�
 if page != "店舗":
     st.session_state["_last_page"] = page
 
+if page in ("本日", "ランキング"):
+    render_favs()
+
 if page == "本日":
     today = dt.date.today().isoformat()
     td = q("""SELECT hall, pref, rules, uplift_mai, uplift_pt, p_shuffle, concentrated,
@@ -2798,6 +3054,16 @@ if page == "本日":
     st.markdown(f"##### {fmt_date(today)} 行くならこの店")
     st.caption("**普段の日より出ている順。** 数字は、その店のイベント日が"
                "通常日を1台あたり何枚上回ったかです。")
+    # 答え合わせを前に出す (#190)。ホールナビ・スロマップAI は「信頼度」「実績◯件」を売りにしている。
+    # 当たった週だけでなく全週の合計を出す。基準を下回っていても同じ形で出す
+    _ts = track_summary()
+    if _ts:
+        _h, _b, _n, _w = _ts
+        st.markdown(
+            f'<div class="c-sub">📋 <b>予想の答え合わせ</b>：直近{_w}週・{_n:,}件で、ここに出した店の的中率 '
+            f'<b>{100*_h:.0f}%</b>（予想に入らなかった店は {100*_b:.0f}%）。'
+            f'外れた週も含めた合計です。<a href="?page=傾向&sub=検証" target="_self">週ごとの結果</a></div>',
+            unsafe_allow_html=True)
     # 範囲指定はページに1つ。イベント店・通常日の店の両方に効かせる。
     # ランキングと同じく折りたたみに (2026-09-04)。条件は見出しに要約
     with st.expander(f"絞り込み ｜ {scope_summary('geo')}", expanded=False):
@@ -3294,7 +3560,7 @@ elif page == "店舗":
                        "(上の「店名で探す」かエリアで絞り込めます)")
         st.stop()
     _back = {}
-    for _k in ("scope", "pref", "city", "addr", "radius"):
+    for _k in ("scope", "pref", "city", "addr", "radius", "fav"):
         if _k in st.query_params:
             _back[_k] = st.query_params[_k]
     st.markdown(
@@ -3303,6 +3569,11 @@ elif page == "店舗":
         "← 店一覧に戻る</a>", unsafe_allow_html=True)
     hinfo = halls[halls["hall"] == hsel].iloc[0]
     st.markdown(f"#### {hsel}")
+    _is_fav = hall_id(hsel) in fav_ids()
+    st.button("★ お気に入りから外す" if _is_fav else "☆ お気に入りに追加", key=f"fav_{hsel}",
+              on_click=_toggle_fav, args=(hsel,))
+    if _is_fav:
+        st.caption("お気に入りは URL に入ります。このページかトップをブックマークしてください。")
     _bd = hall_badges().get(hsel, [])
     if _bd:
         st.markdown(" ".join(f"`{b}`" for b in _bd))
@@ -3410,6 +3681,41 @@ elif page == "店舗":
             f'<span class="jug-lab">{_jl3}</span>'
             f'<span class="jug-note">{_jrk}信頼度 {s}</span></div>',
             unsafe_allow_html=True)
+    # ハナハナ系・ハナビ系 (#178)。ジャグラーと同じ帯で、系統の中での位置を出す
+    # engine が hall_series_stats を作る前の DB でも落とさない
+    for _sr in (("ハナハナ", "ハナビ") if _table_exists("hall_series_stats") else ()):
+        srow = q("""SELECT mean_setting, n_unit_days, drift FROM hall_series_stats
+                    WHERE series=? AND hall=? AND n_unit_days >= ?""", (_sr, hsel, SERIES_MIN_N[_sr]))
+        if srow.empty:
+            continue
+        _ss, _ = stars_by_n(srow["n_unit_days"].iloc[0], srow["drift"].iloc[0])
+        _sv = srow["mean_setting"].iloc[0]
+        _sl = series_label(_sr, _sv)
+        _scls = {"激甘": "hot", "甘め": "warm", "辛め": "cool", "激辛": "cold"}.get(_sl, "")
+        _srk, _srn = series_rank(_sr)[0].get(hsel), len(series_rank(_sr)[1])
+        _snote = " ・ ".join(x for x in (
+            f"全{_srn}店中 上位{_srk}%" if _srk else "", f"信頼度 {_ss}", SERIES_NOTE.get(_sr, "")) if x)
+        st.markdown(
+            f'<div class="jug-band{" jug-" + _scls if _scls else ""}">'
+            f'<span class="jug-cap">{_sr}系 平均予想設定</span>'
+            f'<span class="jug-num">{_sv:.2f}</span>'
+            f'<span class="jug-lab">{_sl}</span>'
+            f'<span class="jug-note">{_snote}</span></div>',
+            unsafe_allow_html=True)
+    # 旧イベ日に入る機種 (#187)。ホールガイドの中心的な見せ方。表は nightly の build_event_matrix.py
+    if _table_exists("hall_event_matrix"):
+        _mx = q("""SELECT rule, date, machine, n_units, avg_diff, label FROM hall_event_matrix
+                   WHERE hall=?""", (hsel,))
+        if not _mx.empty:
+            _rules = list(dict.fromkeys(_mx["rule"]))
+            with st.expander(f"🎯 旧イベ日に入る機種（{'・'.join(_rules)}）", expanded=False):
+                _r = (st.segmented_control("旧イベ日", _rules, default=_rules[0], key=f"mx_{hsel}",
+                                           label_visibility="collapsed") if len(_rules) > 1 else _rules[0]) \
+                    or _rules[0]
+                _sub = _mx[_mx["rule"] == _r]
+                st.markdown(matrix_html(list(_sub[["date", "machine", "n_units", "avg_diff", "label"]]
+                                             .itertuples(index=False, name=None))),
+                            unsafe_allow_html=True)
     # AT機の帯。ジャグラーと並べて、方針が分かれている店が見えるようにする
     _al, _at, _av = at_label(hsel)
     if _al:
@@ -3648,11 +3954,19 @@ elif page == "店舗":
                             f'<div class="mk-line"><span class="mk mk-tai">○ 次点</span>'
                             f'<b>{"、".join(f"{x}番" for x in nos[1:])}</b></div>',
                             unsafe_allow_html=True)
-                    bad = ju[ju["dev_setting"] <= 0]["unit_no"].head(6).tolist()
-                    if bad:
-                        st.caption("低めだった台: "
-                                   + "、".join(f"{int(x)}番" for x in bad)
-                                   + ("…" if len(ju) > len(bad) + len(good) else ""))
+                    # 避けたほうがよい台 (#189)。順位の下から2割。
+                    # 以前は「低めだった台」として dev<=0 の**先頭** (= ぎりぎり平均を割った台) を
+                    # 出しており、いちばん低い台を指していなかった
+                    k = max(1, len(ju) // 5)
+                    worst = ju.sort_values("rank_in_machine", ascending=False).head(k)
+                    worst = worst[worst["dev_setting"] < 0]
+                    if not worst.empty:
+                        st.caption(f"{evidence_badge('small', True)}｜避けたほうがよい台: "
+                                   + "、".join(f"{int(x)}番" for x in sorted(worst["unit_no"])))
+        st.caption("「避けたほうがよい台」は、同じ機種の中で過去の予想設定が下から2割だった台です。"
+                   "前向きに確かめると、その台は次の期間も **-14枚/日**（ランダムに選んだ台は +3枚/日、"
+                   "2,499組・7,090台）。**差はごくわずか**なので、空いている台がそれしか無いなら"
+                   "気にしなくてよい程度です。")
         st.caption("◎は数字上のトップですが、**○との差は誤差の範囲**です"
                    "（前向きに測ると -2.7枚/日、p=0.77）。5台のどれに座っても期待値は"
                    "変わりません。迷ったときの目印として置いています。  \n"
@@ -3992,12 +4306,7 @@ if page == "傾向":
         # 基準 = 同じ日にイベント日レポートがあり、予想に入っていなかった店。判定線は Issue #102
         with st.container(border=True, key=f"card_tr_{_ci()}"):
             st.markdown("**予想の答え合わせ（毎週更新）**")
-            try:
-                trw = q("""SELECT week_start, tier, n_pred, n_real, n_no_report, hit_rate, mean_pt, mean_mai,
-                                  base_n, base_hit_rate, base_pt FROM track_record_weekly
-                           WHERE tier IN ('both','x_daily') ORDER BY week_start DESC, tier""")
-            except Exception:
-                trw = pd.DataFrame()
+            trw = track_weekly()
             if trw.empty:
                 st.caption("2026-09-06 の夜から「サイトが見せた狙い目」を毎晩凍結しています。最初の週次の答え合わせは 2026-09-14 に出ます。"
                            "当たった週も外れた週も、同じ表に載せます。")
@@ -4147,6 +4456,16 @@ if page == "傾向":
                 "**当てることは目的にしていません。** スロットは運の振れ幅がとても大きく、"
                 "誰にも当てられません。できるのは、事実を並べて、選ぶ材料をお渡しすることだけです。"
                 "そこから先はご自身の勘で決めてください。オカルトは大歓迎です。")
+
+        with st.container(border=True, key=f"card14m_{_ci()}"):
+            # 他サイトは負けた日を「-」で隠すことがある。ここは隠さないことを方針として書く (#191)
+            st.markdown("**負けた日も、外れた予想も隠しません**")
+            st.markdown(
+                "店のデータは、出た日もマイナスの日もそのまま集計に入れています。"
+                "良い日だけを並べると、どの店も良く見えてしまうからです。  \n"
+                "サイトが出した予想も、毎晩その時点の内容を固定して翌日以降の結果と照らし合わせ、"
+                "**外れた週も同じ表に載せています**（「検証したこと」の「予想の答え合わせ」）。  \n\n"
+                "掲載内容に誤りがあれば、下の窓口までお知らせください。確認して訂正します。")
 
         with st.container(border=True, key=f"card14n_{_ci()}"):
             # 「近所の店が出てこない＝サイトの不備」と読まれるのを防ぐ。

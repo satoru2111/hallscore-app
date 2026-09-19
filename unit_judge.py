@@ -69,6 +69,9 @@ class Spec:
     bb: tuple[float, ...]
     rb: tuple[float, ...]
     wari: tuple[float, ...]
+    # RT を持つ機種 (アクロス系のハナビ・バーサス) の、BIG1回あたりの RT 上限ゲーム数。
+    # 0 なら RT なし (ジャグラー・ハナハナ)。詳細は _meta.hanabi_note (#171)
+    rt_max: float = 0.0
 
     @property
     def n(self) -> int:
@@ -95,7 +98,8 @@ def load_specs(path: Path = SPECS_PATH) -> tuple[dict[str, Spec], dict[str, str]
         specs[m["key"]] = Spec(m["key"], m["group"], tuple(m["settings"]),
                                tuple(float(x) for x in m["bb"]),
                                tuple(float(x) for x in m["rb"]),
-                               tuple(float(x) for x in m["wari"]))
+                               tuple(float(x) for x in m["wari"]),
+                               float((m.get("rt") or {}).get("max_games", 0) or 0))
         for a in m["aliases"]:
             k = nfkc(a)
             if k in alias and alias[k] != m["key"]:
@@ -157,16 +161,44 @@ def validate_counts(games: int, bb: int, rb: int) -> None:
         raise ValueError(f"ボーナス合算 1/{games / (bb + rb):.0f} はスペック上ありえません")
 
 
+RT_GRID = 9        # RT を周辺化する格子の数。0〜rt_max を等分する
+
+
 def log_likelihood(bb: int, rb: int, games: int, spec: Spec) -> list[float]:
     """設定ごとの対数尤度 (BIG と REG を独立なポアソンとみなす。定数項は落とす).
 
     差枚は使わない。差枚は BIG/REG 回数でほぼ決まるので、併用すると同じ情報を二度数える
     (engine_v0.setting_posterior_bonus と同じ考え方)。
+
+    RT を持つ機種 (#171):
+      公表確率は通常時ゲーム数ベースだが、入力の games は総回転数なので RT ぶん薄まる。
+      総G = 通常時G × (1 + r / BB分母)。r は BIG1回あたりの平均 RT ゲーム数。
+      ⚠️ r は固定値にできない。花火チャレンジはリプレイハズシで延命する仕様で、
+         打ち手の技術によって変わる (rt_max は完全攻略時の上限であって平均ではない)。
+      そこで r を 0〜rt_max の未知パラメータとして周辺化する。
+      2026-09-17 の検証: 比 (BB:RB) だけを使う案は r に非依存だが情報を捨てすぎて
+      判別力が落ちる (RT の無いキングハナハナでも 86% → 66%)。周辺化は固定 r と
+      ほぼ同性能で、r を知らなくてよい。
     """
+    if not spec.rt_max:
+        out = []
+        for nb, nr in zip(spec.bb, spec.rb):
+            lb, lr = games / nb, games / nr
+            out.append(bb * math.log(lb) - lb + rb * math.log(lr) - lr)
+        return out
+
+    grid = [spec.rt_max * i / (RT_GRID - 1) for i in range(RT_GRID)]
+    acc = [[] for _ in spec.bb]
+    for r in grid:
+        for i, (nb, nr) in enumerate(zip(spec.bb, spec.rb)):
+            dil = 1 + r / nb                      # 総G / 通常時G
+            lb, lr = games / (nb * dil), games / (nr * dil)
+            acc[i].append(bb * math.log(lb) - lb + rb * math.log(lr) - lr)
+    # r について一様事前で平均する (対数のまま平均すると別物になるので指数側で足す)
     out = []
-    for nb, nr in zip(spec.bb, spec.rb):
-        lb, lr = games / nb, games / nr
-        out.append(bb * math.log(lb) - lb + rb * math.log(lr) - lr)
+    for lls in acc:
+        mx = max(lls)
+        out.append(mx + math.log(sum(math.exp(v - mx) for v in lls) / len(lls)))
     return out
 
 
